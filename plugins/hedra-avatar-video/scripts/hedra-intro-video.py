@@ -354,6 +354,84 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return out_ass
 
 
+def _burn_karaoke_libass(
+    video_path: str,
+    timings: list,
+    font_dir: str,
+    color_rgb: str,
+    video_h: int,
+) -> None:
+    """Render karaoke captions with libass: full line visible, words fill to accent color on cue."""
+    # Probe video width/height again for PlayRes
+    out = subprocess.run(
+        [FFPROBE, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height",
+         "-of", "csv=p=0:s=x", video_path],
+        check=True, capture_output=True, text=True,
+    )
+    w, h = (int(x) for x in out.stdout.strip().split("x"))
+    fontsize = max(int(h * 0.07), 36)
+    margin_v = int(h * 0.08)
+    primary_bgr = _hex_to_ass_bgr(color_rgb)     # filled (highlighted) colour
+    secondary_bgr = _hex_to_ass_bgr("FFFFFF")    # base colour before fill
+    outline_bgr = _hex_to_ass_bgr("000000")
+
+    # Group words into 6-word lines for readability
+    lines = _group_words(timings, 6)
+    events = []
+    for line_start, line_end, _ in lines:
+        line_words = [(s, e, wo) for s, e, wo in timings
+                      if s >= line_start - 0.01 and e <= line_end + 0.01]
+        if not line_words:
+            continue
+        parts = []
+        for s, e, wo in line_words:
+            cs = max(int((e - s) * 100), 1)  # centiseconds
+            parts.append(r"{\kf" + str(cs) + r"}" + wo + " ")
+        events.append(
+            f"Dialogue: 0,{_ass_time(line_start)},{_ass_time(line_end)},Main,,0,0,0,,"
+            + r"{\fad(120,120)}" + "".join(parts).rstrip()
+        )
+
+    ass_content = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {w}
+PlayResY: {h}
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Main,{BALOO_FAMILY},{fontsize},{primary_bgr},{secondary_bgr},{outline_bgr},&H80000000&,1,0,0,0,100,100,0,0,1,4,2,2,40,40,{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+""" + "\n".join(events) + "\n"
+
+    ass_path = os.path.join(tempfile.mkdtemp(prefix="hedra_karaoke_"), "captions.ass")
+    with open(ass_path, "w") as f:
+        f.write(ass_content)
+
+    def _esc(p: str) -> str:
+        return p.replace("\\", "\\\\").replace(":", r"\:").replace("'", r"\'")
+
+    subs_arg = f"subtitles={_esc(ass_path)}:fontsdir={_esc(font_dir)}"
+    tmp = video_path + ".cap.mp4"
+    cmd = [
+        FFMPEG, "-y", "-i", video_path,
+        "-vf", subs_arg,
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        tmp,
+    ]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        log.error("karaoke burn failed:\n%s", r.stderr.decode()[-2500:])
+        raise RuntimeError("karaoke burn failed — ensure ffmpeg-full is installed (brew install ffmpeg-full)")
+    os.replace(tmp, video_path)
+    log.info("burned karaoke captions via libass (Baloo 2, accent #%s)", color_rgb)
+
+
 def _drawtext_escape(s: str) -> str:
     """Escape text for ffmpeg drawtext filter."""
     return (
@@ -451,24 +529,9 @@ def burn_captions(
         filters.append(dt)
 
     if style == "karaoke":
-        # Overlay: for each word, re-draw it in accent color at its own position.
-        # We approximate position by building the phrase and using 'w'-anchored drawtext per word
-        # using text_align is nontrivial — instead, pop the current word large and centered above the line.
-        pop_fontsize = int(fontsize * 1.05)
-        pop_y = f"h-text_h-{int(h*0.08)}-{int(fontsize*0.1)}"
-        for ws, we, ww in timings:
-            safe = _drawtext_escape(ww)
-            dt = (
-                f"drawtext=fontfile='{font_arg}'"
-                f":text='{safe}'"
-                f":fontcolor=#{color_rgb}"
-                f":fontsize={pop_fontsize}"
-                f":borderw=5:bordercolor=black@0.85"
-                f":shadowx=0:shadowy=3:shadowcolor=black@0.5"
-                f":x=(w-text_w)/2:y={pop_y}"
-                f":enable='between(t,{ws:.3f},{we:.3f})'"
-            )
-            filters.append(dt)
+        # drawtext can't highlight a word inline, so karaoke uses libass instead.
+        # Build an ASS file with \kf tags (per-word fill) and burn via the subtitles filter.
+        return _burn_karaoke_libass(video_path, timings, font_dir, color_rgb, h)
 
     vf = ",".join(filters)
     tmp = video_path + ".cap.mp4"
