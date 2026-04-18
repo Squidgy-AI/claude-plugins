@@ -1,0 +1,16 @@
+{
+  "name": "squidgy",
+  "owner": {
+    "name": "Squidgy",
+    "url": "https://github.com/Squidgy-AI"
+  },
+  "plugins": [
+    {
+      "name": "hedra-avatar-video",
+      "source": "./plugins/hedra-avatar-video",
+      "description": "Generate talking-head intro videos for agents/personas via Hedra Character-3. Optional portrait regeneration (Nano Banana Pro I2I), silence-padded endings, start-frame trimming, and burned-in captions with the Squidgy brand palette.",
+      "version": "0.1.0",
+      "keywords": ["hedra", "avatar", "video", "tts", "character-3", "intro-video", "captions"]
+    }
+  ]
+}

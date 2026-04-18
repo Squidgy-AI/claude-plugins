@@ -1,0 +1,7 @@
+{
+  "name": "hedra-avatar-video",
+  "version": "0.1.0",
+  "description": "Generate talking-head intro videos for agents/personas via Hedra Character-3 (with optional portrait regeneration via Nano Banana Pro).",
+  "author": "Squidgy",
+  "keywords": ["hedra", "avatar", "video", "tts", "character-3", "intro-video"]
+}
