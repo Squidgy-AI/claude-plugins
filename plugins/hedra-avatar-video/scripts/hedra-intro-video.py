@@ -184,7 +184,6 @@ def trim_video_start(path: str, trim_ms: int) -> None:
     if trim_ms <= 0:
         return
     tmp = path + ".trim.mp4"
-    # Re-encode to get a clean cut on keyframe boundaries
     cmd = [
         FFMPEG, "-y", "-ss", f"{trim_ms/1000:.3f}", "-i", path,
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
@@ -195,6 +194,25 @@ def trim_video_start(path: str, trim_ms: int) -> None:
     subprocess.run(cmd, check=True, capture_output=True)
     os.replace(tmp, path)
     log.info("trimmed first %dms", trim_ms)
+
+
+def trim_video_end(path: str, trim_ms: int) -> None:
+    """In-place trim last trim_ms from video using ffmpeg."""
+    if trim_ms <= 0:
+        return
+    dur = _ffmpeg_get_duration(path)
+    new_dur = max(dur - trim_ms / 1000, 0.5)
+    tmp = path + ".trimend.mp4"
+    cmd = [
+        FFMPEG, "-y", "-i", path, "-t", f"{new_dur:.3f}",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        tmp,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    os.replace(tmp, path)
+    log.info("trimmed last %dms", trim_ms)
 
 
 SQUIDGY_COLORS = {
@@ -439,6 +457,90 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     log.info("burned karaoke captions via libass (Baloo 2, accent #%s)", color_rgb)
 
 
+def apply_intro_branding(
+    video_path: str,
+    logo_path: str,
+    name: str,
+    font_dir: str,
+    fade_in_s: float = 0.3,
+    hold_s: float = 2.4,
+    fade_out_s: float = 0.6,
+) -> None:
+    """Overlay Squidgy logo top-left + agent name top-right. Both fade in, hold, fade out at the start."""
+    out = subprocess.run(
+        [FFPROBE, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height",
+         "-of", "csv=p=0:s=x", video_path],
+        check=True, capture_output=True, text=True,
+    )
+    w, h = (int(x) for x in out.stdout.strip().split("x"))
+    margin = int(h * 0.06)
+    logo_h = int(h * 0.12)           # ~86px at 720p
+    name_fs = max(int(h * 0.085), 42)  # ~61px at 720p
+
+    start_fade_in = 0.0
+    end_fade_in = fade_in_s
+    start_fade_out = fade_in_s + hold_s
+    end_fade_out = fade_in_s + hold_s + fade_out_s
+    enable_until = end_fade_out + 0.05
+
+    # Logo alpha fade with the fade filter (video frames per second: assume 24 or probe if needed)
+    # Use time-based fade (st=seconds, d=seconds duration)
+    logo_chain = (
+        f"[1:v]scale=-1:{logo_h}:force_original_aspect_ratio=decrease,"
+        f"fade=t=in:st={start_fade_in:.2f}:d={fade_in_s:.2f}:alpha=1,"
+        f"fade=t=out:st={start_fade_out:.2f}:d={fade_out_s:.2f}:alpha=1[lg]"
+    )
+    overlay_chain = (
+        f"[0:v][lg]overlay=x={margin}:y={margin}:shortest=0:enable='between(t,0,{enable_until:.2f})'[v1]"
+    )
+
+    # Name drawtext with alpha expression (same ramp)
+    font_path = os.path.join(font_dir, "Baloo2-ExtraBold.ttf")
+    font_path_esc = font_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    safe_name = _drawtext_escape(name)
+    # Piecewise alpha: fade-in → 1 → fade-out → 0
+    alpha_expr = (
+        f"if(lt(t,{start_fade_in}),0,"
+        f"if(lt(t,{end_fade_in}),(t-{start_fade_in})/{fade_in_s},"
+        f"if(lt(t,{start_fade_out}),1,"
+        f"if(lt(t,{end_fade_out}),1-(t-{start_fade_out})/{fade_out_s},0))))"
+    )
+    alpha_esc = alpha_expr.replace(":", "\\:").replace(",", "\\,")
+    drawtext_chain = (
+        f"[v1]drawtext=fontfile='{font_path_esc}'"
+        f":text='{safe_name}'"
+        f":fontcolor=white"
+        f":fontsize={name_fs}"
+        f":borderw=4:bordercolor=black@0.85"
+        f":shadowx=0:shadowy=3:shadowcolor=black@0.5"
+        f":x=w-text_w-{margin}:y={margin}"
+        f":alpha='{alpha_esc}'"
+        f":enable='between(t,0,{enable_until:.2f})'[vout]"
+    )
+
+    filter_complex = f"{logo_chain};{overlay_chain};{drawtext_chain}"
+    tmp = video_path + ".brand.mp4"
+    cmd = [
+        FFMPEG, "-y",
+        "-i", video_path,
+        "-loop", "1", "-i", logo_path,     # loop the PNG so fade has frames to work across
+        "-filter_complex", filter_complex,
+        "-map", "[vout]", "-map", "0:a?",
+        "-shortest",                       # end output with the finite video, not the infinite logo loop
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        tmp,
+    ]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        log.error("branding overlay failed:\n%s", r.stderr.decode()[-2500:])
+        raise RuntimeError("branding overlay failed")
+    os.replace(tmp, video_path)
+    log.info("applied intro branding: logo top-left + '%s' top-right", name)
+
+
 def _drawtext_escape(s: str) -> str:
     """Escape text for ffmpeg drawtext filter."""
     return (
@@ -641,9 +743,13 @@ def main():
     p.add_argument("--tail-silence-ms", type=int, default=1500, help="Silence appended after the script so the avatar settles to a resting face before the cut. Set 0 to disable.")
     p.add_argument("--lead-silence-ms", type=int, default=0, help="Silence prepended before the script. Usually unnecessary if --trim-start-ms is used.")
     p.add_argument("--trim-start-ms", type=int, default=400, help="Trim this many ms off the video start to drop the initial soft/blurred frame. Set 0 to disable.")
+    p.add_argument("--trim-end-ms", type=int, default=800, help="Trim this many ms off the video end to drop Hedra's post-speech idle weirdness. Set 0 to disable.")
     p.add_argument("--captions", action="store_true", help="Burn captions into the video (Baloo 2 font, Squidgy palette).")
     p.add_argument("--caption-style", default="clean", choices=["clean", "kinetic", "karaoke"], help="Caption preset.")
     p.add_argument("--caption-color", default="magenta", help="Accent color: red|magenta|purple|white or RRGGBB hex.")
+    p.add_argument("--brand-intro", action="store_true", help="Overlay Squidgy logo (top-left) + agent name (top-right, Baloo 2) that fade in/out at the start.")
+    p.add_argument("--logo", default="/Users/sethward/GIT/Squidgy/squidgy_updated_ui/public/logos/squidgy-logo.png", help="Logo path for --brand-intro.")
+    p.add_argument("--agent-name", default=None, help="Name shown top-right with --brand-intro (e.g. 'Brandy').")
     args = p.parse_args()
 
     api_key = load_api_key()
@@ -696,6 +802,8 @@ def main():
     download(url, args.out)
     if args.trim_start_ms > 0:
         trim_video_start(args.out, args.trim_start_ms)
+    if args.trim_end_ms > 0:
+        trim_video_end(args.out, args.trim_end_ms)
     if args.captions:
         color_hex = SQUIDGY_COLORS.get(args.caption_color.lower(), args.caption_color.lstrip("#"))
         font_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "assets", "fonts"))
@@ -703,8 +811,16 @@ def main():
         speech_start = max((args.lead_silence_ms - args.trim_start_ms) / 1000.0, 0.0)
         # Speech ends where audio stops speaking — total duration minus tail silence
         total_dur = _ffmpeg_get_duration(args.out)
-        speech_end = max(total_dur - args.tail_silence_ms / 1000.0, speech_start + 0.5)
+        # Remaining tail silence after end-trim
+        remaining_tail_s = max((args.tail_silence_ms - args.trim_end_ms) / 1000.0, 0.0)
+        speech_end = max(total_dur - remaining_tail_s, speech_start + 0.5)
         burn_captions(args.out, args.script, args.caption_style, color_hex, font_dir, speech_start, speech_end)
+    if args.brand_intro:
+        if not args.agent_name:
+            print("error: --agent-name required with --brand-intro", file=sys.stderr)
+            sys.exit(1)
+        font_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "assets", "fonts"))
+        apply_intro_branding(args.out, args.logo, args.agent_name, font_dir)
     print(args.out)
 
 
