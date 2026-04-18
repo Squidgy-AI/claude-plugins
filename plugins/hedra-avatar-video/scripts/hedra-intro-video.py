@@ -372,9 +372,9 @@ def _burn_karaoke_libass(
     w, h = (int(x) for x in out.stdout.strip().split("x"))
     fontsize = max(int(h * 0.07), 36)
     margin_v = int(h * 0.08)
-    primary_bgr = _hex_to_ass_bgr(color_rgb)     # filled (highlighted) colour
-    secondary_bgr = _hex_to_ass_bgr("FFFFFF")    # base colour before fill
-    outline_bgr = _hex_to_ass_bgr("000000")
+    white_bgr = _hex_to_ass_bgr("FFFFFF")
+    accent_bgr = _hex_to_ass_bgr(color_rgb)
+    black_bgr = _hex_to_ass_bgr("000000")
 
     # Group words into 6-word lines for readability
     lines = _group_words(timings, 6)
@@ -384,14 +384,21 @@ def _burn_karaoke_libass(
                       if s >= line_start - 0.01 and e <= line_end + 0.01]
         if not line_words:
             continue
-        parts = []
-        for s, e, wo in line_words:
-            cs = max(int((e - s) * 100), 1)  # centiseconds
-            parts.append(r"{\kf" + str(cs) + r"}" + wo + " ")
-        events.append(
-            f"Dialogue: 0,{_ass_time(line_start)},{_ass_time(line_end)},Main,,0,0,0,,"
-            + r"{\fad(120,120)}" + "".join(parts).rstrip()
-        )
+        # Emit one Dialogue per word: full line in white, current word scaled +15%
+        # with an accent-coloured outline halo. Discrete transitions, always readable.
+        for i, (ws, we, _) in enumerate(line_words):
+            parts = []
+            for j, (_, _, wj) in enumerate(line_words):
+                if j == i:
+                    parts.append(r"{\fscx115\fscy115\bord6\3c" + accent_bgr + r"}" + wj + r"{\r}")
+                else:
+                    parts.append(wj)
+            text = " ".join(parts)
+            # Fade only on first/last word of the line for smooth entry/exit
+            fade = r"{\fad(120,0)}" if i == 0 else (r"{\fad(0,120)}" if i == len(line_words) - 1 else "")
+            events.append(
+                f"Dialogue: 0,{_ass_time(ws)},{_ass_time(we)},Main,,0,0,0,,{fade}{text}"
+            )
 
     ass_content = f"""[Script Info]
 ScriptType: v4.00+
@@ -401,7 +408,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Main,{BALOO_FAMILY},{fontsize},{primary_bgr},{secondary_bgr},{outline_bgr},&H80000000&,1,0,0,0,100,100,0,0,1,4,2,2,40,40,{margin_v},1
+Style: Main,{BALOO_FAMILY},{fontsize},{white_bgr},{white_bgr},{black_bgr},&H80000000&,1,0,0,0,100,100,0,0,1,3,2,2,40,40,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
